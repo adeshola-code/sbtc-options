@@ -102,3 +102,106 @@
         (var-set oracle-address new-oracle)
         (ok true))
 )
+
+;; Set Price Validity Window
+(define-public (set-price-validity-window (new-window uint))
+    (begin
+        (asserts! (is-contract-owner) ERR_NOT_AUTHORIZED)
+        (asserts! (and (>= new-window MIN_VALIDITY_WINDOW) 
+                      (<= new-window MAX_VALIDITY_WINDOW)) ERR_INVALID_PARAMETER)
+        (var-set price-validity-window new-window)
+        (ok true))
+)
+
+;; Private Functions
+
+;; Authorization Check
+(define-private (is-contract-owner)
+    (is-eq tx-sender CONTRACT_OWNER)
+)
+
+;; Option Expiry Check
+(define-private (check-expiry (option-id uint))
+    (let (
+        (option (unwrap! (map-get? options option-id) ERR_OPTION_NOT_FOUND))
+        (current-height block-height)
+    )
+    (if (> current-height (get expiry option))
+        ERR_OPTION_EXPIRED
+        (ok true)
+    ))
+)
+
+;; Balance Management
+(define-private (update-user-balance (user principal) (delta uint) (is-subtract bool))
+    (let (
+        (current-balance (default-to {sbtc-balance: u0, locked-collateral: u0} 
+                        (map-get? user-balances user)))
+        (current-sbtc (get sbtc-balance current-balance))
+        (new-balance (if is-subtract
+                        (begin
+                            (asserts! (>= current-sbtc delta) ERR_INSUFFICIENT_BALANCE)
+                            (- current-sbtc delta))
+                        (+ current-sbtc delta)))
+    )
+    (ok (map-set user-balances 
+        user 
+        (merge current-balance {sbtc-balance: new-balance})))
+    )
+)
+
+;; Public Functions
+
+;; Deposit sBTC
+(define-public (deposit-sbtc (amount uint))
+    (begin
+        (asserts! (and (>= amount MIN_DEPOSIT_AMOUNT)
+                      (<= amount MAX_DEPOSIT_AMOUNT)) ERR_INVALID_AMOUNT)
+        (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+        (try! (update-user-balance tx-sender amount false))
+        (ok true)
+    )
+)
+
+;; Create Option
+(define-public (create-option (option-type (string-ascii 4)) 
+                            (strike-price uint)
+                            (expiry uint)
+                            (amount uint))
+    (let (
+        (option-id (var-get next-option-id))
+        (required-collateral (/ (* amount strike-price) u100))
+        (user-balance (default-to {sbtc-balance: u0, locked-collateral: u0} 
+                     (map-get? user-balances tx-sender)))
+    )
+    (asserts! (or (is-eq option-type "CALL") (is-eq option-type "PUT")) 
+              ERR_NOT_AUTHORIZED)
+    (asserts! (>= strike-price u0) ERR_INVALID_STRIKE_PRICE)
+    (asserts! (and (> expiry block-height)
+                   (<= (- expiry block-height) u5200)) ERR_INVALID_EXPIRY)
+    (asserts! (and (>= amount MIN_DEPOSIT_AMOUNT)
+                   (<= amount MAX_DEPOSIT_AMOUNT)) ERR_INVALID_AMOUNT)
+    (asserts! (>= (get sbtc-balance user-balance) required-collateral) 
+              ERR_INSUFFICIENT_COLLATERAL)
+    
+    (try! (update-user-balance tx-sender required-collateral true))
+    
+    (map-set options option-id {
+        creator: tx-sender,
+        holder: tx-sender,
+        option-type: option-type,
+        strike-price: strike-price,
+        expiry: expiry,
+        amount: amount,
+        collateral: required-collateral,
+        status: "ACTIVE"
+    })
+    
+    (map-set user-balances tx-sender
+        (merge user-balance {
+            locked-collateral: (+ (get locked-collateral user-balance) required-collateral)
+        }))
+    
+    (var-set next-option-id (+ option-id u1))
+    (ok option-id))
+)
